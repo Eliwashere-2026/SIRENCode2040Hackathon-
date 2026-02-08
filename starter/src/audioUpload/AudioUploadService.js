@@ -1,142 +1,256 @@
 // AudioUploadService.js
-// Basic starter implementation for recording audio in chunks and uploading to Firebase Storage
-// IMPORTANT: This is a hackathon MVP starter. Test thoroughly on real devices and follow the library docs.
+// Native audio recording with Firebase Storage upload and Firestore tracking
+// Handles chunked recording, encryption placeholder, and background upload
 
+import { Platform } from 'react-native';
 import AudioRecorderPlayer from 'react-native-audio-recorder-player';
 import RNFS from 'react-native-fs';
 import firestore from '@react-native-firebase/firestore';
 import storage from '@react-native-firebase/storage';
 import auth from '@react-native-firebase/auth';
+import { requestAudioPermission, requestStoragePermission } from '../utils/permissions';
 
-const CHUNK_MS = 15 * 1000; // 15s chunks (adjust as needed)
+const CHUNK_INTERVAL_MS = 15 * 1000; // 15s chunks
 const recorder = new AudioRecorderPlayer();
 
 let _currentAlertId = null;
 let _chunkIndex = 0;
 let _chunkTimer = null;
 let _currentFilePath = null;
+let _recordingPath = null;
+let _isRecording = false;
 
+/**
+ * Ensure directory exists for recordings
+ */
 const ensureDir = async (dir) => {
   try {
     const exists = await RNFS.exists(dir);
-    if (!exists) await RNFS.mkdir(dir);
-  } catch (e) {
-    console.warn('ensureDir failed', e);
+    if (!exists) {
+      await RNFS.mkdir(dir);
+      console.log('Created directory:', dir);
+    }
+  } catch (error) {
+    console.error('ensureDir failed:', error);
   }
 };
 
-const encryptBase64 = async (base64) => {
-  // Placeholder: implement AES-GCM or similar using device Keystore/Keychain
-  // For prototype we return base64 directly; DO NOT use in production without encryption
-  return base64;
+/**
+ * Placeholder encryption - REPLACE WITH REAL ENCRYPTION IN PRODUCTION
+ * For hackathon MVP, returns base64; implement AES-GCM with Keychain/Keystore
+ */
+const encryptChunk = async (base64Data) => {
+  // TODO: Implement actual AES-GCM encryption using react-native-keychain
+  // For now, return as-is but flag for future encryption
+  return base64Data;
 };
 
-const uploadChunk = async (path, alertId) => {
+/**
+ * Upload a chunk to Firebase Storage with retry logic
+ */
+const uploadChunk = async (filePath, alertId, retries = 3) => {
   try {
-    const stat = await RNFS.stat(path);
-    if (!stat || !stat.isFile()) return;
+    const fileExists = await RNFS.exists(filePath);
+    if (!fileExists) {
+      console.warn('File does not exist:', filePath);
+      return false;
+    }
 
-    const base64 = await RNFS.readFile(path, 'base64');
-    const encrypted = await encryptBase64(base64);
+    const stat = await RNFS.stat(filePath);
+    console.log(`Uploading chunk: ${stat.size} bytes`);
+
+    const base64 = await RNFS.readFile(filePath, 'base64');
+    const encrypted = await encryptChunk(base64);
 
     const user = auth().currentUser;
-    if (!user) throw new Error('Not authenticated');
+    if (!user) {
+      console.error('User not authenticated');
+      return false;
+    }
 
-    const filename = `${_chunkIndex++}_${Date.now()}.m4a`;
+    const timestamp = Date.now();
+    const filename = `${_chunkIndex++}_${timestamp}.m4a`;
     const remotePath = `alerts/${user.uid}/${alertId}/${filename}`;
 
-    // upload base64 to Firebase Storage
+    // Upload to Firebase Storage
     const ref = storage().ref(remotePath);
-    await ref.putString(encrypted, 'base64', { contentType: 'audio/m4a' });
-
-    // add metadata to Firestore for the alert
-    await firestore().collection('alerts').doc(alertId).collection('chunks').add({
-      path: remotePath,
-      size: stat.size,
-      uploadedAt: firestore.FieldValue.serverTimestamp(),
+    await ref.putString(encrypted, 'base64', {
+      contentType: 'audio/m4a',
+      cacheControl: 'public, max-age=3600',
     });
 
-    // remove local file
-    await RNFS.unlink(path);
-  } catch (e) {
-    console.error('uploadChunk error', e);
+    console.log('Chunk uploaded:', remotePath);
+
+    // Record metadata in Firestore
+    await firestore()
+      .collection('alerts')
+      .doc(alertId)
+      .collection('chunks')
+      .add({
+        path: remotePath,
+        size: stat.size,
+        index: _chunkIndex - 1,
+        uploadedAt: firestore.FieldValue.serverTimestamp(),
+      });
+
+    // Delete local file after successful upload
+    try {
+      await RNFS.unlink(filePath);
+    } catch (e) {
+      console.warn('Failed to delete local chunk:', e);
+    }
+
+    return true;
+  } catch (error) {
+    console.error('Upload chunk error:', error);
+    if (retries > 0) {
+      console.log(`Retrying upload... (${retries} retries left)`);
+      await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1s before retry
+      return uploadChunk(filePath, alertId, retries - 1);
+    }
+    return false;
   }
 };
 
+/**
+ * Rotate chunk: stop current recording, upload it, start new one
+ */
 const rotateChunk = async (alertId) => {
   try {
-    // stop current recording, upload, then start a new file
-    await recorder.stopRecorder();
-    if (_currentFilePath) {
+    console.log('Rotating chunk...');
+    
+    // Stop current recorder
+    try {
+      await recorder.stopRecorder();
+    } catch (e) {
+      console.warn('Error stopping recorder:', e);
+    }
+
+    // Upload completed chunk
+    if (_currentFilePath && _isRecording) {
       await uploadChunk(_currentFilePath, alertId);
     }
 
-    // start a fresh recorder for the next chunk
-    const dir = `${RNFS.DocumentDirectoryPath}/sirens`;
-    await ensureDir(dir);
-    _currentFilePath = `${dir}/${alertId}_${Date.now()}.m4a`;
-    await recorder.startRecorder(_currentFilePath);
-  } catch (e) {
-    console.error('rotateChunk error', e);
+    // Start new recording if still active
+    if (_isRecording) {
+      _currentFilePath = `${_recordingPath}/${alertId}_chunk_${_chunkIndex}.m4a`;
+      try {
+        await recorder.startRecorder(_currentFilePath);
+        console.log('New chunk recording started');
+      } catch (e) {
+        console.error('Failed to start new recorder:', e);
+      }
+    }
+  } catch (error) {
+    console.error('rotateChunk error:', error);
   }
 };
 
-export default {
-  startRecording: async () => {
-    const user = auth().currentUser;
-    if (!user) throw new Error('User must be signed in to start recording.');
+/**
+ * Initialize recording and create Firestore alert document
+ */
+const startRecording = async () => {
+  try {
+    // Verify permissions
+    const audioPermOk = await requestAudioPermission();
+    const storagePermOk = await requestStoragePermission();
 
-    // create alert doc first
+    if (!audioPermOk) {
+      throw new Error('Microphone permission denied');
+    }
+
+    const user = auth().currentUser;
+    if (!user) {
+      throw new Error('User must be signed in to start recording');
+    }
+
+    _isRecording = true;
+
+    // Create alert document in Firestore
     const alertRef = await firestore().collection('alerts').add({
       userId: user.uid,
       status: 'recording',
       startedAt: firestore.FieldValue.serverTimestamp(),
+      platform: Platform.OS,
     });
-    const alertId = alertRef.id;
-    _currentAlertId = alertId;
+
+    _currentAlertId = alertRef.id;
     _chunkIndex = 0;
+    console.log('Alert created:', _currentAlertId);
 
-    // start first chunk immediately
-    const dir = `${RNFS.DocumentDirectoryPath}/sirens`;
-    await ensureDir(dir);
-    _currentFilePath = `${dir}/${alertId}_${Date.now()}.m4a`;
+    // Set up recording directory
+    _recordingPath = `${RNFS.DocumentDirectoryPath}/sirens`;
+    await ensureDir(_recordingPath);
 
+    // Start first chunk
+    _currentFilePath = `${_recordingPath}/${_currentAlertId}_chunk_0.m4a`;
     await recorder.startRecorder(_currentFilePath);
+    console.log('Recording started:', _currentFilePath);
 
-    // start timer to rotate chunk periodically
-    _chunkTimer = setInterval(() => rotateChunk(alertId), CHUNK_MS);
+    // Set up chunking timer
+    _chunkTimer = setInterval(() => rotateChunk(_currentAlertId), CHUNK_INTERVAL_MS);
 
-    return alertId;
-  },
+    return _currentAlertId;
+  } catch (error) {
+    console.error('startRecording error:', error);
+    _isRecording = false;
+    throw error;
+  }
+};
 
-  stopRecording: async () => {
-    try {
-      if (_chunkTimer) {
-        clearInterval(_chunkTimer);
-        _chunkTimer = null;
-      }
+/**
+ * Stop recording and finalize
+ */
+const stopRecording = async () => {
+  try {
+    _isRecording = false;
 
-      // stop and upload last chunk
-      try { await recorder.stopRecorder(); } catch (e) { /* ignore */ }
-      if (_currentFilePath) await uploadChunk(_currentFilePath, _currentAlertId);
-
-      // update Firestore alert status
-      if (_currentAlertId) {
-        await firestore().collection('alerts').doc(_currentAlertId).update({
-          status: 'completed',
-          completedAt: firestore.FieldValue.serverTimestamp(),
-        });
-      }
-
-    } catch (e) {
-      console.error('stopRecording error', e);
-    } finally {
-      _currentAlertId = null;
-      _currentFilePath = null;
-      _chunkIndex = 0;
+    if (_chunkTimer) {
+      clearInterval(_chunkTimer);
+      _chunkTimer = null;
     }
-  },
 
-  // helper for debugging
-  isRecording: () => !!_currentAlertId,
+    // Stop recorder
+    try {
+      await recorder.stopRecorder();
+    } catch (e) {
+      console.warn('Error stopping recorder:', e);
+    }
+
+    // Upload final chunk
+    if (_currentFilePath && _currentAlertId) {
+      await uploadChunk(_currentFilePath, _currentAlertId);
+    }
+
+    // Update alert status
+    if (_currentAlertId) {
+      await firestore().collection('alerts').doc(_currentAlertId).update({
+        status: 'completed',
+        completedAt: firestore.FieldValue.serverTimestamp(),
+      });
+      console.log('Alert completed:', _currentAlertId);
+    }
+
+    console.log('Recording stopped');
+  } catch (error) {
+    console.error('stopRecording error:', error);
+    throw error;
+  } finally {
+    // Reset state
+    _currentAlertId = null;
+    _currentFilePath = null;
+    _chunkIndex = 0;
+    _recordingPath = null;
+  }
+};
+
+/**
+ * Get current recording status
+ */
+const isRecording = () => _isRecording && !!_currentAlertId;
+
+export default {
+  startRecording,
+  stopRecording,
+  isRecording,
 };
