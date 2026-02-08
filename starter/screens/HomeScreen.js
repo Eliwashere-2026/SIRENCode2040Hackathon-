@@ -1,11 +1,93 @@
-import React, { useState } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Alert } from 'react-native';
-import AudioUploadService from '../src/audioUpload/AudioUploadService';
+import React, { useRef, useState } from 'react';
+import { View, Text, StyleSheet, TouchableOpacity, Alert, Platform, TextInput } from 'react-native';
+
+const AudioUploadService =
+  Platform.OS === 'web'
+    ? {
+        startRecording: async () => {},
+        stopRecording: async () => {},
+      }
+    : require('../src/audioUpload/AudioUploadService').default;
 
 export default function HomeScreen() {
   const [isRecording, setIsRecording] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [phone, setPhone] = useState('');
+  const [apiBaseUrl, setApiBaseUrl] = useState('http://localhost:3001');
+  const mediaRecorderRef = useRef(null);
+  const mediaStreamRef = useRef(null);
+  const mediaChunksRef = useRef([]);
+  const videoPreviewRef = useRef(null);
+
+  const sendPing = async () => {
+    if (!phone) return;
+    try {
+      const response = await fetch(`${apiBaseUrl}/ping`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contacts: [phone],
+          message: 'SIREN activated. Please check in ASAP.',
+          location: null,
+        }),
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || 'Ping failed');
+      }
+    } catch (err) {
+      Alert.alert('Ping failed', err.message || 'Unable to send SMS');
+    }
+  };
+
+  const startWebRecording = async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('Webcam/mic not available in this browser.');
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    mediaStreamRef.current = stream;
+    if (videoPreviewRef.current) {
+      videoPreviewRef.current.srcObject = stream;
+      await videoPreviewRef.current.play();
+    }
+    const recorder = new MediaRecorder(stream);
+    mediaChunksRef.current = [];
+    recorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0) {
+        mediaChunksRef.current.push(event.data);
+      }
+    };
+    recorder.start();
+    mediaRecorderRef.current = recorder;
+  };
+
+  const stopWebRecording = async () => {
+    const recorder = mediaRecorderRef.current;
+    if (!recorder) return;
+    await new Promise((resolve) => {
+      recorder.onstop = resolve;
+      recorder.stop();
+    });
+    const blob = new Blob(mediaChunksRef.current, { type: 'video/webm' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `siren_recording_${Date.now()}.webm`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+    mediaChunksRef.current = [];
+    mediaRecorderRef.current = null;
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+    }
+    if (videoPreviewRef.current) {
+      videoPreviewRef.current.srcObject = null;
+    }
+  };
 
   const handlePress = async () => {
     try {
@@ -14,14 +96,33 @@ export default function HomeScreen() {
 
       if (!isRecording) {
         // START RECORDING
-        await AudioUploadService.startRecording();
+        if (Platform.OS === 'web') {
+          await startWebRecording();
+        } else {
+          await AudioUploadService.startRecording();
+        }
         setIsRecording(true);
-        Alert.alert('✅ Recording Started', 'SIREN is now recording audio and tracking location.');
+        Alert.alert(
+          '✅ Recording Started',
+          Platform.OS === 'web'
+            ? 'Recording webcam + mic on this computer.'
+            : 'SIREN is now recording audio and tracking location.'
+        );
+        await sendPing();
       } else {
         // STOP RECORDING
-        await AudioUploadService.stopRecording();
+        if (Platform.OS === 'web') {
+          await stopWebRecording();
+        } else {
+          await AudioUploadService.stopRecording();
+        }
         setIsRecording(false);
-        Alert.alert('✅ Recording Stopped', 'Your recording has been saved and uploaded.');
+        Alert.alert(
+          '✅ Recording Stopped',
+          Platform.OS === 'web'
+            ? 'Saved to your Downloads folder.'
+            : 'Your recording has been saved and uploaded.'
+        );
       }
     } catch (err) {
       const errorMsg = err.message || 'Unknown error';
@@ -37,7 +138,49 @@ export default function HomeScreen() {
     <View style={styles.container}>
       <Text style={styles.title}>🚨 SIREN</Text>
       <Text style={styles.subtitle}>Your Safety, Your Rights</Text>
-      
+
+      {Platform.OS === 'web' && (
+        <View style={styles.previewCard}>
+          <Text style={styles.inputLabel}>Live Preview</Text>
+          <View style={styles.previewFrame}>
+            <video
+              ref={videoPreviewRef}
+              style={styles.previewVideo}
+              muted
+              playsInline
+            />
+          </View>
+        </View>
+      )}
+
+      <View style={styles.inputCard}>
+        <Text style={styles.inputLabel}>Ping Phone Number</Text>
+        <TextInput
+          value={phone}
+          onChangeText={setPhone}
+          placeholder="+15551234567"
+          placeholderTextColor="rgba(255,255,255,0.6)"
+          style={styles.input}
+          keyboardType="phone-pad"
+          autoCapitalize="none"
+        />
+        <Text style={styles.inputHint}>
+          Sends an SMS when SIREN is activated.
+        </Text>
+      </View>
+
+      <View style={styles.inputCard}>
+        <Text style={styles.inputLabel}>SMS API URL</Text>
+        <TextInput
+          value={apiBaseUrl}
+          onChangeText={setApiBaseUrl}
+          placeholder="http://localhost:3001"
+          placeholderTextColor="rgba(255,255,255,0.6)"
+          style={styles.input}
+          autoCapitalize="none"
+        />
+      </View>
+
       <TouchableOpacity 
         style={[styles.sirenButton, isRecording && styles.sirenActive]}
         onPress={handlePress}
@@ -118,6 +261,51 @@ const styles = StyleSheet.create({
     color: 'white',
     fontWeight: '600',
     fontSize: 14,
+  },
+  inputCard: {
+    width: '100%',
+    backgroundColor: 'rgba(255,255,255,0.12)',
+    padding: 12,
+    borderRadius: 12,
+    marginBottom: 12,
+  },
+  inputLabel: {
+    color: 'white',
+    fontWeight: '600',
+    marginBottom: 6,
+  },
+  inputHint: {
+    color: 'rgba(255,255,255,0.8)',
+    fontSize: 12,
+    marginTop: 6,
+  },
+  input: {
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.4)',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    color: 'white',
+  },
+  previewCard: {
+    width: '100%',
+    backgroundColor: 'rgba(255,255,255,0.12)',
+    padding: 12,
+    borderRadius: 12,
+    marginBottom: 12,
+  },
+  previewFrame: {
+    width: 240,
+    height: 320,
+    borderRadius: 12,
+    overflow: 'hidden',
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    alignSelf: 'center',
+  },
+  previewVideo: {
+    width: '100%',
+    height: '100%',
+    objectFit: 'contain',
   },
   errorContainer: {
     marginTop: 15,
